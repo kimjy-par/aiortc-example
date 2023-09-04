@@ -12,26 +12,31 @@ import aiohttp_cors
 from aiohttp import web
 from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
 from aiortc.contrib.media import MediaBlackhole, MediaPlayer, MediaRecorder, MediaRelay
+from aiortc.sdp import candidate_from_sdp
 from av import VideoFrame
+from aiortc.contrib.signaling import object_from_string
+from collections import defaultdict
+
 
 ROOT = os.path.dirname(__file__)
 
 logger = logging.getLogger("pc")
-pcs = set()
+pcs = {}
+orphan_candidate = defaultdict(lambda :[])
 relay = MediaRelay()
 
 
-cap = cv2.VideoCapture("your.stream.uri.com")
 
 class MyVideoStreamTrack(VideoStreamTrack):
     def __init__(self):
         super().__init__()
+        self.cap = cv2.VideoCapture("rtsp://admin:aidkr1120!@pigrienpam1-1.mycam.to:551/ch1/stream1")
         
     async def recv(self):
         pts, time_base = await self.next_timestamp()
         timenow = str(datetime.datetime.now())
         #print({"pts": pts, "time_base": time_base, "time": timenow})
-        ret, image = cap.read()
+        image = cv2.imread("test.png")
         cv2.putText(image, timenow, (100, 100), cv2.FONT_HERSHEY_SIMPLEX, 4, (255, 255, 255), 3)
         frame = VideoFrame.from_ndarray(image, format="bgr24")
         frame.pts = pts
@@ -43,30 +48,20 @@ async def signaling(request):
     offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
     
     pc = RTCPeerConnection()
-    pc_id = "PeerConnection(%s)" % uuid.uuid4()
-    pcs.add(pc)
-    def log_info(msg, *args):
-        logger.info(pc_id + " " + msg, *args)
+    pc_id = params['id']
+    pc.client_id = pc_id
+    pcs[pc.client_id] = pc
 
-    log_info("Created for %s", request.remote)
+    pc.emit("connectionstatechange", on_connectionstatechange(pc))
+    pc.emit("track", add_track(pc))
 
-    @pc.on("connectionstatechange")
-    async def on_connectionstatechange():
-        log_info("Connection state is %s", pc.connectionState)
-        if pc.connectionState == "failed":
-            await pc.close()
-            pcs.discard(pc)
-
-    @pc.on("track")
-    def on_track(track):
-        log_info("Track %s received", track.kind)
-        pc.addTrack(MyVideoStreamTrack())
-    
     await pc.setRemoteDescription(offer)
 
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
-    
+
+    [pc.addIceCandidate(ice) for ice in orphan_candidate[pc_id]]    
+
     return web.Response(
         content_type="application/json",
         text=json.dumps(
@@ -74,12 +69,46 @@ async def signaling(request):
         ),
     )
 
+def add_track(pc):
+    pc.addTrack(MyVideoStreamTrack())
+
+async def on_connectionstatechange(pc):
+        if pc.connectionState == "failed":
+            await pc.close()
+            del pcs[pc.client_id]
+
+async def ice_negotiation(request):
+    try:
+        params = await request.json()
+        print({"ice_sdp": params})
+        
+        pc_id = params['id']
+
+        candidate_sdp = params['candidate'].replace('candidate:', '')
+
+        ice = candidate_from_sdp(candidate_sdp)
+        ice.sdpMid = params["sdpMid"]
+        ice.sdpMLineIndex = params["sdpMLineIndex"]
+        print(ice)
+
+        pc = pcs[pc_id]
+        await pc.addIceCandidate(ice)
+
+        return web.Response(
+            content_type="application/json",
+            text=json.dumps({"status": "ok"})
+        )
+    except KeyError:
+        orphan_candidate[pc_id].append(ice)
+
+
+
 async def on_shutdown(app):
     # close peer connections
     coros = [pc.close() for pc in pcs]
     await asyncio.gather(*coros)
     pcs.clear()
-
+   
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -112,7 +141,8 @@ if __name__ == "__main__":
 
     app.on_shutdown.append(on_shutdown)
     app.router.add_post("/offer", signaling)
-    
+    app.router.add_post("/ice", ice_negotiation)
+
     cors = aiohttp_cors.setup(app, defaults={
             "*": aiohttp_cors.ResourceOptions(
             allow_credentials=True,
