@@ -20,7 +20,7 @@ can connect to from your browser:
 .. code-block:: console
 
     $ python server.py
-
+ 
 You can then browse to the following page with your browser:
 
 http://127.0.0.1:8080
